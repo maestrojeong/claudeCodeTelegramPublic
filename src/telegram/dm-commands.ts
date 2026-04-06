@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, readdirSync, unlinkSync } from "fs";
+import { writeFileSync, appendFileSync, readdirSync, renameSync } from "fs";
 import { join } from "path";
 import { bot } from "@/telegram/client";
 import {
@@ -18,8 +18,16 @@ import type { EffortLevel } from "@/core/types";
 import { DM_CMD_DIR, DM_RESP_DIR } from "@/core/config";
 import { ForumTopic, getSessionInjectHandler } from "@/telegram/outbox-types";
 import { deleteTopicWithArchive } from "@/core/topic-lifecycle";
+import { acquireJsonlLines, cleanupProcessing } from "@/telegram/outbox-utils";
 
 export { DM_CMD_DIR };
+
+/** Atomically write a response file (tmp + rename) to prevent partial reads by MCP pollers. */
+function writeResponse(respFile: string, data: object) {
+  const tmp = respFile + ".tmp";
+  writeFileSync(tmp, JSON.stringify(data));
+  renameSync(tmp, respFile);
+}
 
 export async function flushDmCommands() {
   let files: string[];
@@ -32,15 +40,9 @@ export async function flushDmCommands() {
 
   for (const file of files) {
     const filePath = join(DM_CMD_DIR, file);
-    let lines: string[];
-    try {
-      lines = readFileSync(filePath, "utf-8").trim().split("\n").filter(Boolean);
-    } catch (e) {
-      logger.warn({ err: e, file }, "dm-commands: Failed to read");
-      continue;
-    }
 
-    if (lines.length === 0) continue;
+    const lines = acquireJsonlLines(filePath, "dm-commands");
+    if (!lines) continue;
 
     const remaining: string[] = [];
     for (const line of lines) {
@@ -56,13 +58,13 @@ export async function flushDmCommands() {
 
         if (cmd.action === "create_topic") {
           if (!config || config.forumGroupIds.length === 0) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: "No forum group linked" }));
+            writeResponse(respFile, { success: false, error: "No forum group linked" });
             continue;
           }
           // Use group_id from params if specified, otherwise first group
           const targetGroupId = cmd.params.group_id ? Number(cmd.params.group_id) : config.forumGroupIds[0];
           if (!config.forumGroupIds.includes(targetGroupId)) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: `Group ${targetGroupId} is not connected` }));
+            writeResponse(respFile, { success: false, error: `Group ${targetGroupId} is not connected` });
             continue;
           }
           try {
@@ -82,18 +84,18 @@ export async function flushDmCommands() {
             if (cmd.params.model && cmd.params.model !== "default") setTopicModel(uid, topicName, cmd.params.model as string);
             if (cmd.params.effort && cmd.params.effort !== "default") setTopicEffort(uid, topicName, cmd.params.effort as EffortLevel);
             const link = getTopicLink(targetGroupId, result.message_thread_id);
-            writeFileSync(respFile, JSON.stringify({ success: true, link }));
+            writeResponse(respFile, { success: true, link });
           } catch (e) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: e instanceof Error ? e.message : "unknown" }));
+            writeResponse(respFile, { success: false, error: e instanceof Error ? e.message : "unknown" });
           }
         } else if (cmd.action === "delete_topic") {
           if (!config) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: "No config" }));
+            writeResponse(respFile, { success: false, error: "No config" });
             continue;
           }
           const topic = getTopicByName(uid, cmd.params.name);
           if (!topic) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: "Topic not found" }));
+            writeResponse(respFile, { success: false, error: "Topic not found" });
             continue;
           }
           try {
@@ -104,25 +106,25 @@ export async function flushDmCommands() {
               forumGroupId: topic.forumGroupId,
               messageThreadId: topic.messageThreadId,
             });
-            writeFileSync(respFile, JSON.stringify(result));
+            writeResponse(respFile, result);
           } catch (e) {
-            writeFileSync(respFile, JSON.stringify({ success: false, error: e instanceof Error ? e.message : "unknown" }));
+            writeResponse(respFile, { success: false, error: e instanceof Error ? e.message : "unknown" });
           }
         } else if (cmd.action === "set_description") {
           const ok = setTopicDescription(uid, cmd.params.topic as string, cmd.params.description as string);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_cwd") {
           const cwd = cmd.params.cwd as string | null;
           const ok = setTopicCwd(uid, cmd.params.topic as string, cwd);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_model") {
           const model = cmd.params.model === "default" ? null : cmd.params.model as string;
           const ok = setTopicModel(uid, cmd.params.topic as string, model);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_effort") {
           const effort = cmd.params.effort === "default" ? null : cmd.params.effort as EffortLevel;
           const ok = setTopicEffort(uid, cmd.params.topic as string, effort);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_mcp_enabled") {
           const rawEnabled = cmd.params.enabled as string[] | null;
           const required = ["session-comm", "send-file", "cron-manager"];
@@ -130,12 +132,12 @@ export async function flushDmCommands() {
             ? null
             : [...new Set([...rawEnabled, ...required.filter(r => !rawEnabled.includes(r))])];
           const ok = setTopicMcpEnabled(uid, cmd.params.topic as string, safeEnabled);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_mcp_extra") {
           const ok = setTopicMcpExtra(uid, cmd.params.topic as string, cmd.params.extra as Record<string, unknown>);
-          writeFileSync(respFile, JSON.stringify({ success: ok, error: ok ? undefined : "Topic not found" }));
+          writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else {
-          writeFileSync(respFile, JSON.stringify({ success: false, error: `Unknown action: ${cmd.action}` }));
+          writeResponse(respFile, { success: false, error: `Unknown action: ${cmd.action}` });
         }
       } catch (e) {
         logger.warn({ err: e, file }, "dm-commands: Failed to process command");
@@ -143,15 +145,15 @@ export async function flushDmCommands() {
       }
     }
 
-    // Remove processed file or write back remaining
-    try {
-      if (remaining.length === 0) {
-        unlinkSync(filePath);
-      } else {
-        writeFileSync(filePath, remaining.join("\n") + "\n");
+    cleanupProcessing(filePath);
+
+    // Write back failed lines for retry on next poll
+    if (remaining.length > 0) {
+      try {
+        appendFileSync(filePath, remaining.join("\n") + "\n");
+      } catch (e) {
+        logger.warn({ err: e, file }, "dm-commands: Failed to write back remaining");
       }
-    } catch (e) {
-      logger.warn({ err: e, file }, "dm-commands: Failed to cleanup");
     }
   }
 }

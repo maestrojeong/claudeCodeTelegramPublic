@@ -25,7 +25,7 @@ db.exec("PRAGMA journal_mode = WAL");
 db.exec("PRAGMA foreign_keys = OFF");
 
 // 소스 DB attach
-db.exec(`ATTACH DATABASE '${sourceDbPath}' AS src`);
+db.exec(`ATTACH DATABASE '${sourceDbPath.replace(/'/g, "''")}' AS src`);
 
 // 소스 유저 목록 확인
 const srcUsers = db.query<{ id: string; forum_group_title: string | null }, []>(

@@ -99,8 +99,8 @@ export function isDebugUser(): boolean {
   if (_isDebugUser !== undefined) return _isDebugUser;
   try {
     if (!existsSync(DEBUG_FILE)) return (_isDebugUser = false);
-    const users: number[] = JSON.parse(readFileSync(DEBUG_FILE, "utf-8"));
-    return (_isDebugUser = users.includes(Number(userId)));
+    const users: (string | number)[] = JSON.parse(readFileSync(DEBUG_FILE, "utf-8"));
+    return (_isDebugUser = users.some((u) => String(u) === String(userId)));
   } catch {
     return (_isDebugUser = false);
   }
