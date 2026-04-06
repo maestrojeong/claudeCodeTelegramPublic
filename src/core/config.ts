@@ -1,0 +1,140 @@
+import { resolve, dirname } from "path";
+import { readFileSync, mkdirSync } from "fs";
+import { homedir } from "os";
+import { fileURLToPath } from "url";
+
+const HOME = homedir();
+
+// new URL("../..", import.meta.url) causes webpack to treat "../.." as a module import.
+// Split into fileURLToPath → dirname → resolve to avoid that.
+export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+export const CLAUDE_EXECUTABLE = resolve(HOME, ".local/bin/claude");
+
+export const SEND_FILE_SERVER = resolve(PROJECT_ROOT, "src/mcp/send-file-server.ts");
+
+export const SESSION_COMM_SERVER = resolve(PROJECT_ROOT, "src/mcp/session-comm-server.ts");
+
+export const CRON_MANAGER_SERVER = resolve(PROJECT_ROOT, "src/mcp/cron-manager-server.ts");
+
+export const DM_MANAGER_SERVER = resolve(PROJECT_ROOT, "src/mcp/dm-manager-server.ts");
+
+export const TOKEN_STATS_SERVER = resolve(PROJECT_ROOT, "src/mcp/token-stats-server.ts");
+
+export const META_DIR = resolve(PROJECT_ROOT, "meta");
+
+// Persistent state (survives restarts, long-lived)
+export const DATA_DIR = resolve(PROJECT_ROOT, "data");
+export const SESSIONS_DB = resolve(DATA_DIR, "sessions.db");
+export const DEBUG_FILE = resolve(DATA_DIR, "debug-users.json");
+export const USERS_LOG_DIR = resolve(DATA_DIR, "users");
+
+// Runtime IPC queues (transient, safe to clear on restart)
+export const RUN_DIR = resolve(PROJECT_ROOT, "run");
+export const PROGRESS_DIR = resolve(RUN_DIR, "progress");
+export const DM_CMD_DIR = resolve(RUN_DIR, "dm-commands");
+export const DM_RESP_DIR = resolve(RUN_DIR, "dm-responses");
+export const SESSION_INBOX_DIR = resolve(RUN_DIR, "session-inbox");
+mkdirSync(PROGRESS_DIR, { recursive: true });
+mkdirSync(DM_CMD_DIR, { recursive: true });
+mkdirSync(DM_RESP_DIR, { recursive: true });
+mkdirSync(SESSION_INBOX_DIR, { recursive: true });
+
+/** Stale threshold for active-query state files (crash recovery) */
+export const ACTIVE_QUERY_STALE_MS = 10 * 60 * 1000; // 10 minutes
+
+
+const PROMPTS_DIR = resolve(PROJECT_ROOT, "src/core/prompts");
+export const AGENTS_PROMPTS_DIR = resolve(PROMPTS_DIR, "agents");
+const SESSIONS_DIR = resolve(PROMPTS_DIR, "sessions");
+const RESOURCES_DIR = resolve(PROJECT_ROOT, "src/core/resources");
+
+function loadPrompt(filename: string, dir = SESSIONS_DIR): string {
+  const raw = readFileSync(resolve(dir, filename), "utf-8");
+  return raw
+    .replace(/\{\{RESOURCES_DIR\}\}/g, RESOURCES_DIR);
+}
+
+export interface AgentDef {
+  name: string;
+  type: "autonomous" | "programmatic";
+  model?: string;
+  tools?: string[];
+  description?: string;
+  prompt: string;
+}
+
+export function loadAgentPrompt(filename: string): AgentDef {
+  const raw = readFileSync(resolve(AGENTS_PROMPTS_DIR, filename), "utf-8");
+  const match = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) throw new Error(`Agent prompt ${filename} is missing frontmatter`);
+
+  // Minimal YAML parser: supports scalar values and string arrays (2-space "  - item" lists).
+  // Empty lines are skipped explicitly — without the guard they'd match the scalar branch
+  // and reset currentKey, silently truncating any list that follows.
+  const meta: Record<string, unknown> = {};
+  let currentKey: string | null = null;
+  for (const line of match[1].split("\n")) {
+    if (/^\w[^:]*:$/.test(line)) {
+      currentKey = line.trim().replace(/:$/, "");
+      meta[currentKey] = [];
+    } else if (line.startsWith("  - ") && currentKey) {
+      (meta[currentKey] as string[]).push(line.slice(4).trim());
+    } else if (line.trim() !== "" && line.includes(":") && !line.startsWith(" ")) {
+      currentKey = null;
+      const colonIdx = line.indexOf(":");
+      const key = line.slice(0, colonIdx).trim();
+      const value = line.slice(colonIdx + 1).trim();
+      if (key && value) meta[key] = value;
+    }
+  }
+
+  return {
+    name: String(meta.name ?? filename.replace(".md", "")),
+    type: (meta.type as AgentDef["type"]) ?? "programmatic",
+    model: meta.model ? String(meta.model) : undefined,
+    tools: Array.isArray(meta.tools) ? meta.tools as string[] : undefined,
+    description: meta.description ? String(meta.description) : undefined,
+    prompt: match[2].trim(),
+  };
+}
+
+export const SYSTEM_PROMPT = loadPrompt("topic-system.md");
+export const DM_SYSTEM_PROMPT = loadPrompt("dm-system.md");
+
+const DELEGATE_SYSTEM_PROMPT_RAW = loadPrompt("delegate-system.md", AGENTS_PROMPTS_DIR);
+
+export function buildTopicSystemPrompt(opts?: {
+  description?: string | null;
+}): string {
+  let prompt = SYSTEM_PROMPT;
+  if (opts?.description) {
+    prompt += "\n\n## Topic-Specific Instructions\n" + opts.description;
+  }
+  return prompt;
+}
+
+export function buildDelegateSystemPrompt(opts: {
+  from: string;
+  description?: string | null;
+}): string {
+  let prompt = DELEGATE_SYSTEM_PROMPT_RAW.replace(/\{\{FROM\}\}/g, opts.from);
+  if (opts.description) {
+    prompt += "\n\n## Role\n" + opts.description;
+  }
+  return prompt;
+}
+
+/** Returns process.env without CLAUDECODE, to prevent nested claude-code detection in subprocesses. */
+export function getCleanEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+  return env;
+}
+
+export const FILE_EXTENSIONS_REGEX =
+  /(?:\/[^\s"'<>|*?\[\]]+\.(?:png|jpg|jpeg|gif|webp|svg|pdf|csv|xlsx|xls|json|txt|md|html|zip|py|js|ts|tsx|jsx|css|xml|yaml|yml|docx|pptx))/gi;
+
+export const FILE_TAG_REGEX = /\[FILE:(\/[^\]]+)\]/gi;
+
+// MCP server builders → src/core/mcp-config.ts

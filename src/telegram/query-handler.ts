@@ -1,0 +1,622 @@
+import TelegramBot from "node-telegram-bot-api";
+import { mkdirSync, existsSync, readFileSync, realpathSync } from "fs";
+import { join, resolve } from "path";
+import { bot } from "@/telegram/client";
+import { sendMsg, sendHtmlMsg, sendFileToChat, splitMessage, sendSplitMsg } from "@/telegram/helpers";
+import { writeLog } from "@/telegram/logging";
+import { isDebug, writeQueryState, clearQueryState } from "@/telegram/workspace";
+import { claudeQuery, formatToolUse } from "@/core/claude";
+import type { TokenUsage, EffortLevel } from "@/core/types";
+import { logger } from "@/core/logger";
+import { homedir } from "os";
+import { USERS_LOG_DIR } from "@/core/config";
+
+function expandHome(p: string | null): string | null {
+  if (!p) return null;
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  return p;
+}
+import {
+  getSessionForTopic,
+  setSessionForTopic,
+  clearSessionForTopic,
+  setDmSessionId,
+  clearDmSessionId,
+  getTopicByName,
+  getTopicMcpConfig,
+  getTopicDescription,
+  getTopicCwd,
+} from "@/telegram/forum-sessions";
+import { buildTopicSystemPrompt } from "@/core/config";
+import { recordUsage } from "@/core/token-stats";
+import { checkQueryUsageAlert } from "@/core/session-alert";
+import { appendContext } from "@/core/context-store";
+
+// --- Sensitive path blacklist ---
+const SENSITIVE_PATH_PATTERNS = [
+  /\/\.env(\.|$)/i,
+  /\/\.ssh\//i,
+  /\/\.aws\//i,
+  /\/\.gnupg\//i,
+  /\/\.netrc$/i,
+  /\/\.npmrc$/i,
+  /\/(id_rsa|id_ed25519|id_ecdsa|id_dsa)(\.pub)?$/i,
+  /\.(pem|key|p12|pfx|cer|crt)$/i,
+  /\/Library\/Keychains\//i,
+];
+
+function isSensitivePath(filePath: string): boolean {
+  const normalized = resolve(filePath);
+  if (SENSITIVE_PATH_PATTERNS.some((p) => p.test(normalized))) return true;
+  try {
+    const real = realpathSync(normalized);
+    if (real !== normalized) return SENSITIVE_PATH_PATTERNS.some((p) => p.test(real));
+  } catch {
+    // File doesn't exist — no symlink concern
+  }
+  return false;
+}
+
+// --- cwd validation ---
+const BLOCKED_CWD_PREFIXES = ["/etc", "/var", "/System", "/Library", "/usr", "/sbin", "/bin", "/private/etc", "/private/var"];
+
+function isAllowedCwd(cwd: string): boolean {
+  const resolved = resolve(cwd);
+  // Block system-critical directories
+  for (const prefix of BLOCKED_CWD_PREFIXES) {
+    if (resolved === prefix || resolved.startsWith(prefix + "/")) return false;
+  }
+  // Must be under home directory or USERS_LOG_DIR
+  const home = homedir();
+  return resolved.startsWith(home + "/") || resolved === home
+    || resolved.startsWith(USERS_LOG_DIR + "/") || resolved === USERS_LOG_DIR;
+}
+
+// --- Parameter interfaces ---
+
+interface BaseQueryParams {
+  chatId: number;
+  userId: number;
+  topicName: string;
+  sessionId: string | null;
+  prompt: string;
+  senderId?: number;
+}
+
+interface OutputParams {
+  messageThreadId?: number;
+  systemPrompt?: string;
+  cwd?: string;
+  sessionType?: "dm" | "forum" | "ephemeral";
+  model?: string;
+  silent?: boolean;
+  effort?: EffortLevel;
+}
+
+interface SessionChainParams {
+  from?: string;
+  depth?: number;
+  chain?: string[];
+  requestId?: string;
+  contextId?: string;
+  isCommand?: boolean;
+  agents?: Record<string, { description: string; prompt: string; model?: string; tools?: string[]; maxTurns?: number }>;
+}
+
+interface RetryGuardParams {
+  _sessionRetried?: boolean;
+}
+
+export interface HandleClaudeQueryParams
+  extends BaseQueryParams, OutputParams, SessionChainParams, RetryGuardParams {}
+
+// --- Abort reason ---
+
+export enum AbortReason {
+  None     = "none",
+  Internal = "internal",
+  External = "external",
+}
+
+// --- Active queries (userId:topicName → abort control) ---
+
+export const activeQueries = new Map<string, {
+  abortReason: AbortReason;
+  userId: number;
+  senderId?: number;
+  abortController: AbortController;
+  params?: HandleClaudeQueryParams;
+}>();
+
+// --- Inter-session queue: defers inject requests while a query is running ---
+
+class SessionInjectQueue {
+  private queue = new Map<string, HandleClaudeQueryParams[]>();
+
+  enqueue(queryKey: string, params: HandleClaudeQueryParams, logReason: string): boolean {
+    if (!params.requestId) {
+      logger.warn({ queryKey, from: params.from }, "Session inject has no requestId, skipping queue");
+      return false;
+    }
+    const q = this.queue.get(queryKey) ?? [];
+    if (q.some((p) => p.requestId === params.requestId)) return false;
+    q.push(params);
+    this.queue.set(queryKey, q);
+    logger.info({ queryKey, from: params.from, requestId: params.requestId }, logReason);
+    return true;
+  }
+
+  dequeueNext(queryKey: string): HandleClaudeQueryParams | undefined {
+    const q = this.queue.get(queryKey);
+    if (!q?.length) return undefined;
+    const next = q.shift()!;
+    if (q.length === 0) this.queue.delete(queryKey);
+    return next;
+  }
+}
+
+// --- User message queue: defers messages from different senders on the same topic ---
+
+class UserMessageQueue {
+  private queue = new Map<string, HandleClaudeQueryParams[]>();
+
+  enqueue(queryKey: string, params: HandleClaudeQueryParams): void {
+    const q = this.queue.get(queryKey) ?? [];
+    q.push(params);
+    this.queue.set(queryKey, q);
+    logger.info({ queryKey, senderId: params.senderId }, "User message queued: different sender on busy topic");
+  }
+
+  dequeueNext(queryKey: string): HandleClaudeQueryParams | undefined {
+    const q = this.queue.get(queryKey);
+    if (!q?.length) return undefined;
+    const next = q.shift()!;
+    if (q.length === 0) this.queue.delete(queryKey);
+    return next;
+  }
+}
+
+const userMessageQueue = new UserMessageQueue();
+
+const interSessionQueue = new SessionInjectQueue();
+
+// --- DM session retry guard ---
+const dmRetryingUsers = new Set<number>();
+
+const SESSION_EXPIRED_MSG = "No conversation found with session ID";
+
+function detectSessionExpiry(
+  params: HandleClaudeQueryParams,
+  errMsg: string,
+  userId: number,
+  topicName: string,
+): "dm-retry" | "forum-retry" | null {
+  if (params._sessionRetried || !errMsg.includes(SESSION_EXPIRED_MSG)) return null;
+
+  if (params.sessionType === "dm") {
+    if (!dmRetryingUsers.has(userId)) {
+      clearDmSessionId(userId);
+      dmRetryingUsers.add(userId);
+      logger.info({ userId }, "DM session expired, cleared and will retry");
+      return "dm-retry";
+    }
+  } else {
+    clearSessionForTopic(userId, topicName);
+    logger.info({ userId, topicName }, "Forum session expired, cleared and will retry");
+    return "forum-retry";
+  }
+  return null;
+}
+
+// --- Shared Claude query handler ---
+
+export async function handleClaudeQuery(params: HandleClaudeQueryParams) {
+  const { chatId, userId, topicName, sessionId, prompt, messageThreadId } = params;
+  const queryKey = `${userId}:${topicName}`;
+
+  const threadOpts: TelegramBot.SendMessageOptions = messageThreadId ? { message_thread_id: messageThreadId } : {};
+
+  // Per-user concurrent query limit
+  const MAX_CONCURRENT_PER_USER = 10;
+  const userActiveCount = [...activeQueries.values()].filter((q) => q.userId === userId).length;
+  if (userActiveCount >= MAX_CONCURRENT_PER_USER) {
+    if (!params.silent) {
+      await sendMsg(chatId, "처리 중인 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.", threadOpts).catch(() => {});
+    }
+    return;
+  }
+
+  async function sendToThread(text: string, extraOpts?: TelegramBot.SendMessageOptions) {
+    if (params.silent) return;
+    await sendHtmlMsg(chatId, text, { ...threadOpts, ...extraOpts });
+  }
+
+  // Same topic → abort previous query, with priority: user > session inject
+  // Multi-user: only abort if same sender; different sender → queue
+  const incomingSenderId = params.senderId;
+  const runningOnThis = activeQueries.get(queryKey);
+  if (runningOnThis) {
+    const incomingIsSession = params.from && params.from !== "user";
+    const runningIsUser = !runningOnThis.params?.from || runningOnThis.params.from === "user";
+
+    if (incomingIsSession && runningIsUser) {
+      interSessionQueue.enqueue(queryKey, params, "Session inject deferred: user query running");
+      return;
+    }
+
+    if (incomingIsSession && !runningIsUser) {
+      interSessionQueue.enqueue(queryKey, params, "Session inject queued: another session inject running");
+      return;
+    }
+
+    // Different sender on same topic → queue instead of abort
+    if (incomingSenderId && runningOnThis.senderId && incomingSenderId !== runningOnThis.senderId) {
+      userMessageQueue.enqueue(queryKey, params);
+      return;
+    }
+
+    // Same sender (or no sender info) → abort previous
+    if (runningOnThis.params?.from && runningOnThis.params.from !== "user") {
+      interSessionQueue.enqueue(queryKey, runningOnThis.params, "Inter-session query aborted by user, re-queued for later");
+    }
+    runningOnThis.abortReason = AbortReason.Internal;
+    runningOnThis.abortController.abort();
+  }
+
+  const abortController = new AbortController();
+  const control = { abortReason: AbortReason.None, userId, senderId: incomingSenderId, abortController, params };
+  activeQueries.set(queryKey, control);
+
+  const isInject = !!(params.from && params.from !== "user") && !params.isCommand;
+
+  const chatActionOpts: TelegramBot.SendChatActionOptions = messageThreadId ? { message_thread_id: messageThreadId } : {};
+  if (!isInject) {
+    bot.sendChatAction(chatId, "typing", chatActionOpts).catch(() => {});
+  }
+  const typingInterval = setInterval(() => {
+    if (control.abortReason !== AbortReason.None) return clearInterval(typingInterval);
+    if (!isInject) bot.sendChatAction(chatId, "typing", chatActionOpts).catch(() => {});
+  }, 4000);
+
+  writeQueryState(userId, topicName, prompt);
+
+  let pendingInject: {
+    params: Parameters<typeof handleClaudeQuery>[0];
+    errorChatId: number;
+    errorThreadId: number;
+  } | null = null;
+  let pendingDmRetry = false;
+  let pendingForumRetry = false;
+
+  // --- Tool status message (temporary, editable) ---
+  let toolStatusMsgId: number | null = null;
+
+  async function showToolStatus(text: string) {
+    if (isInject) return;
+    try {
+      if (toolStatusMsgId) {
+        await bot.editMessageText(text, { chat_id: chatId, message_id: toolStatusMsgId });
+      } else {
+        const msgOpts: TelegramBot.SendMessageOptions = messageThreadId ? { message_thread_id: messageThreadId } : {};
+        const sent = await bot.sendMessage(chatId, text, msgOpts);
+        toolStatusMsgId = sent.message_id;
+      }
+    } catch {
+      // Edit/send can fail if message was already deleted, ignore
+    }
+  }
+
+  async function clearToolStatus() {
+    if (!toolStatusMsgId) return;
+    const msgId = toolStatusMsgId;
+    toolStatusMsgId = null;
+    try {
+      await bot.deleteMessage(chatId, msgId);
+    } catch {
+      // Already deleted or too old, ignore
+    }
+  }
+
+  try {
+    const topicCwd = params.sessionType !== "dm" && params.sessionType !== "ephemeral"
+      ? getTopicCwd(userId, topicName)
+      : null;
+    const rawCwd = expandHome(params.cwd) || expandHome(topicCwd) || homedir();
+    const userCwd = isAllowedCwd(rawCwd) ? rawCwd : homedir();
+    if (rawCwd !== userCwd) {
+      logger.warn({ userId, topicName, requestedCwd: rawCwd, fallbackCwd: userCwd }, "Blocked disallowed cwd, falling back to homedir");
+    }
+    mkdirSync(userCwd, { recursive: true });
+
+    const mcpConfig =
+      params.sessionType !== "dm" && params.sessionType !== "ephemeral"
+        ? getTopicMcpConfig(userId, topicName)
+        : { enabled: null, extra: {} };
+
+    let textBuffer = "";
+    let lastPreToolText = "";
+    let finalResponse = "";
+    let resultSent = false;
+    let finalUsage: TokenUsage | undefined;
+    let currentSessionId: string | null = sessionId;
+    const seenFiles = new Set<string>();
+    const debug = isDebug(userId);
+
+    async function flushText() {
+      if (!textBuffer.trim()) return;
+      let toSend = textBuffer.trim();
+      textBuffer = "";
+      if (isInject) return;
+      await clearToolStatus();
+      for (const chunk of splitMessage(toSend)) {
+        await sendToThread(chunk);
+      }
+    }
+
+    for await (const event of claudeQuery({
+      prompt,
+      sessionId: sessionId || undefined,
+      cwd: userCwd,
+      userId: String(userId),
+      session: topicName,
+      systemPrompt: params.systemPrompt,
+      sessionType: params.sessionType,
+      abortController,
+      model: params.model,
+      depth: params.depth ?? 0,
+      chain: params.chain ?? [topicName],
+      agents: params.agents,
+      effort: params.effort,
+      mcpEnabled: mcpConfig.enabled,
+      mcpExtra: mcpConfig.extra,
+    })) {
+      if (control.abortReason !== AbortReason.None) break;
+
+      switch (event.type) {
+        case "session":
+          currentSessionId = event.sessionId;
+          if (params.sessionType === "ephemeral") {
+            // Ephemeral sessions — don't persist session ID
+          } else if (params.sessionType === "dm") {
+            setDmSessionId(userId, event.sessionId);
+          } else if (!isInject) {
+            setSessionForTopic(userId, topicName, event.sessionId);
+          }
+          break;
+
+        case "tool_use":
+          if (debug) {
+            await flushText();
+          } else {
+            if (textBuffer.trim()) lastPreToolText = textBuffer.trim();
+            textBuffer = "";
+          }
+          if (!isInject && event.name) {
+            const label = formatToolUse(event.name, event.input || {});
+            await showToolStatus(`🔧 ${label}`);
+          }
+          break;
+
+        case "tool_progress":
+          break;
+
+        case "tool_use_summary":
+          if (debug) {
+            await flushText();
+            await sendToThread(event.summary);
+          } else {
+            textBuffer = "";
+          }
+          break;
+
+        case "tool_result":
+          break;
+
+        case "text_delta":
+          if (!resultSent) textBuffer += event.content;
+          break;
+
+        case "text":
+          if (!resultSent) textBuffer = event.content;
+          break;
+
+        case "result": {
+          resultSent = true;
+          textBuffer = "";
+          await clearToolStatus();
+          finalUsage = event.usage;
+          if (event.content && event.content.trim()) {
+            const clean = event.content.replace(/\[FILE:\/[^\]]+\]/g, "").trim();
+            if (clean) {
+              finalResponse = clean;
+              if (!isInject) {
+                for (const chunk of splitMessage(clean)) {
+                  await sendToThread(chunk);
+                }
+              }
+            }
+          }
+          break;
+        }
+
+        case "file": {
+          if (isInject) break;
+          if (seenFiles.has(event.path)) break;
+          seenFiles.add(event.path);
+          if (isSensitivePath(event.path)) {
+            logger.warn({ path: event.path, userId }, "Blocked sensitive file path");
+            break;
+          }
+          try {
+            if (!existsSync(event.path)) {
+              await sendToThread(`File: ${event.path}`);
+              break;
+            }
+            await sendFileToChat(chatId, event.path, threadOpts);
+          } catch {
+            await sendToThread(`File: ${event.path}`);
+          }
+          break;
+        }
+
+        case "error":
+          if (!isInject) await sendToThread(`Error: ${event.content}`);
+          break;
+      }
+    }
+
+    // If no result was sent, flush remaining text or fall back to last pre-tool text
+    if (!resultSent) {
+      if (textBuffer.trim()) {
+        finalResponse = textBuffer.trim();
+        await flushText();
+      } else if (lastPreToolText) {
+        finalResponse = lastPreToolText;
+        if (!isInject) {
+          for (const chunk of splitMessage(lastPreToolText)) {
+            await sendToThread(chunk);
+          }
+        }
+      }
+    } else if (debug) {
+      await flushText();
+    }
+
+    writeLog({
+      timestamp: new Date().toISOString(),
+      userId,
+      sessionId: getSessionForTopic(userId, topicName) || null,
+      session: topicName,
+      prompt,
+      response: finalResponse,
+      usage: finalUsage,
+    });
+    if (finalUsage) {
+      logger.info({
+        userId,
+        session: topicName,
+        inputTokens: finalUsage.inputTokens,
+        outputTokens: finalUsage.outputTokens,
+        cacheCreationInputTokens: finalUsage.cacheCreationInputTokens,
+        cacheReadInputTokens: finalUsage.cacheReadInputTokens,
+      }, "Claude token usage");
+      recordUsage(userId, topicName, finalUsage);
+      if (params.sessionType !== "dm" && params.sessionType !== "ephemeral" && !isInject) {
+        checkQueryUsageAlert(userId, topicName, finalUsage);
+      }
+    }
+
+    // Save response to context store
+    if (params.contextId && finalResponse && control.abortReason === AbortReason.None) {
+      appendContext(userId, params.contextId, { role: topicName, content: finalResponse, ts: new Date().toISOString() });
+    }
+
+    // Prepare inject params — fired in finally after activeQueries cleanup
+    const senderName = params.from;
+    const depth = params.depth ?? 0;
+    if (senderName && senderName !== "user" && depth > 0 && control.abortReason === AbortReason.None && finalResponse && !params.isCommand) {
+      const senderTopic = getTopicByName(userId, senderName);
+      if (senderTopic?.sessionId) {
+        const senderChain = (params.chain ?? []).slice(0, -1);
+        const injectPrompt = `[${topicName} 세션 응답 (depth: ${depth - 1}/5)]\n${finalResponse}`;
+        await sendSplitMsg(senderTopic.forumGroupId, `[← ${topicName}]\n${finalResponse}`, { message_thread_id: senderTopic.messageThreadId }).catch(
+          (e) => logger.warn({ err: e }, "ask_session: failed to send response to sender topic")
+        );
+        pendingInject = {
+          params: {
+            chatId: senderTopic.forumGroupId,
+            userId,
+            topicName: senderName,
+            sessionId: senderTopic.sessionId,
+            prompt: injectPrompt,
+            messageThreadId: senderTopic.messageThreadId,
+            systemPrompt: buildTopicSystemPrompt({
+              description: getTopicDescription(userId, senderName),
+            }),
+            from: topicName,
+            depth: depth - 1,
+            chain: senderChain,
+          },
+          errorChatId: senderTopic.forumGroupId,
+          errorThreadId: senderTopic.messageThreadId,
+        };
+      }
+    }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : "Unknown error";
+
+    const expiryRetry = detectSessionExpiry(params, errMsg, userId, topicName);
+    if (expiryRetry === "dm-retry") {
+      pendingDmRetry = true;
+    } else if (expiryRetry === "forum-retry") {
+      pendingForumRetry = true;
+    } else if (control.abortReason === AbortReason.None && !params.silent) {
+      await sendMsg(chatId, `Error: ${errMsg}`, threadOpts).catch((e) =>
+        logger.error({ err: e }, "Failed to send error message")
+      );
+    }
+  } finally {
+    clearInterval(typingInterval);
+    if (toolStatusMsgId) {
+      bot.deleteMessage(chatId, toolStatusMsgId).catch(() => {});
+      toolStatusMsgId = null;
+    }
+    if (activeQueries.get(queryKey) === control) {
+      activeQueries.delete(queryKey);
+      clearQueryState(userId, topicName);
+    }
+
+    // If externally aborted while processing a session chain request, notify sender
+    const senderName = params.from;
+    const depth = params.depth ?? 0;
+    if (control.abortReason === AbortReason.External && senderName && senderName !== "user" && depth > 0 && !pendingInject && !params.isCommand) {
+      const senderTopic = getTopicByName(userId, senderName);
+      if (senderTopic) {
+        sendMsg(senderTopic.forumGroupId, `[← ${topicName}]\n(abort됨: 외부 중단 요청으로 응답을 받을 수 없습니다)`, {
+          message_thread_id: senderTopic.messageThreadId,
+        }).catch((e) => logger.error({ err: e }, "Failed to notify sender of aborted session"));
+      }
+    }
+
+    // Fire inject AFTER activeQueries cleanup
+    if (pendingInject) {
+      const { params: injectParams, errorChatId, errorThreadId } = pendingInject;
+      logger.info({ userId, from: topicName, to: injectParams.topicName, depth: injectParams.depth }, "Injecting reply back to sender");
+      handleClaudeQuery(injectParams).catch((e) => {
+        logger.error({ err: e }, "Failed to inject reply to sender");
+        const errMsg = e instanceof Error ? e.message : "Unknown error";
+        sendMsg(errorChatId, `[${topicName} → ${injectParams.topicName}] 세션 응답 전달 실패: ${errMsg}`, { message_thread_id: errorThreadId }).catch(() => {});
+      });
+    }
+
+    // Retry with fresh session after expiry
+    if (pendingDmRetry) {
+      handleClaudeQuery({ ...params, sessionId: null, _sessionRetried: true })
+        .finally(() => dmRetryingUsers.delete(userId))
+        .catch((e) => logger.error({ err: e }, "Failed to retry DM query after session expiry"));
+    }
+    if (pendingForumRetry) {
+      handleClaudeQuery({ ...params, sessionId: null, _sessionRetried: true })
+        .catch((e) => logger.error({ err: e }, "Failed to retry forum query after session expiry"));
+    }
+
+    // Re-execute next queued inter-session request
+    const next = interSessionQueue.dequeueNext(queryKey);
+    if (next) {
+      logger.info({ queryKey, from: next.from }, "Re-executing queued inter-session query");
+      handleClaudeQuery(next).catch((e) =>
+        logger.error({ err: e, queryKey }, "Failed to re-execute queued inter-session query")
+      );
+    } else {
+      // Re-execute next queued user message (from different sender)
+      const nextUser = userMessageQueue.dequeueNext(queryKey);
+      if (nextUser) {
+        logger.info({ queryKey, senderId: nextUser.senderId }, "Re-executing queued user message");
+        handleClaudeQuery(nextUser).catch((e) =>
+          logger.error({ err: e, queryKey }, "Failed to re-execute queued user message")
+        );
+      }
+    }
+  }
+}

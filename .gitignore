@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Runtime data
+data/
+run/
+logs/
+
+# Build output
+.next/
+tsconfig.tsbuildinfo
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# Lock files
+bun.lock
+
+# Misc
+scrape_gn.js
