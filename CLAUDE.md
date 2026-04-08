@@ -26,7 +26,7 @@ src/
 │       └── dm-system.md     # DM 세션용 시스템 프롬프트 (온보딩)
 ├── telegram/                # Telegram 봇 레이어
 │   ├── bot.ts               # 엔트리포인트 — 이벤트 바인딩, 라우팅, cleanup
-│   ├── client.ts            # TelegramBot 인스턴스, TOKEN, ALLOWED_USERS
+│   ├── client.ts            # TelegramBot 인스턴스, TOKEN, TELEGRAM_ADMIN_USERS
 │   ├── helpers.ts           # withRetry, sendMsg/Photo/Doc, splitMessage, markdownToTelegramHtml, sendHtmlMsg, sendFileToChat
 │   ├── logging.ts           # 활동 로그 JSONL 기록/조회, 로테이션 (파일 크기 기반)
 │   ├── workspace.ts         # 사용자 워크스페이스 초기화, 디버그 토글, lock 파일
@@ -113,7 +113,7 @@ bun run start     # 프로덕션
 | 변수 | 필수 | 설명 |
 |------|------|------|
 | `TELEGRAM_BOT_TOKEN` | Y | Telegram Bot API 토큰 |
-| `TELEGRAM_ALLOWED_USERS` | Y | 허용 사용자 ID (쉼표 구분) |
+| `TELEGRAM_ADMIN_USERS` | Y | 허용 사용자 ID (쉼표 구분) |
 | `WHISPER_BIN` | Y | whisper 바이너리 경로 |
 | `FFMPEG_BIN` | Y | ffmpeg 바이너리 경로 |
 | `LOG_LEVEL` | N | pino 로그 레벨 (기본: `info`) |
