@@ -11,10 +11,16 @@ import { logger } from "@/core/logger";
 import { homedir } from "os";
 import { USERS_LOG_DIR } from "@/core/config";
 
+const HOME_DIR = homedir();
+const EXTRA_ALLOWED_CWD_PREFIXES: string[] = (process.env.ALLOWED_CWD_PREFIXES || "")
+  .split(",")
+  .map(p => p.trim())
+  .filter(Boolean);
+
 function expandHome(p: string | null): string | null {
   if (!p) return null;
-  if (p === "~") return homedir();
-  if (p.startsWith("~/")) return join(homedir(), p.slice(2));
+  if (p === "~") return HOME_DIR;
+  if (p.startsWith("~/")) return join(HOME_DIR, p.slice(2));
   return p;
 }
 import {
@@ -67,10 +73,13 @@ function isAllowedCwd(cwd: string): boolean {
   for (const prefix of BLOCKED_CWD_PREFIXES) {
     if (resolved === prefix || resolved.startsWith(prefix + "/")) return false;
   }
-  // Must be under home directory or USERS_LOG_DIR
-  const home = homedir();
-  return resolved.startsWith(home + "/") || resolved === home
-    || resolved.startsWith(USERS_LOG_DIR + "/") || resolved === USERS_LOG_DIR;
+  // Must be under home directory, USERS_LOG_DIR, or extra allowed prefixes
+  if (resolved.startsWith(HOME_DIR + "/") || resolved === HOME_DIR
+    || resolved.startsWith(USERS_LOG_DIR + "/") || resolved === USERS_LOG_DIR) return true;
+  for (const prefix of EXTRA_ALLOWED_CWD_PREFIXES) {
+    if (resolved === prefix || resolved.startsWith(prefix + "/")) return true;
+  }
+  return false;
 }
 
 // --- Parameter interfaces ---

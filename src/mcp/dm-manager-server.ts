@@ -162,6 +162,43 @@ function saveDebugUsers(users: Set<string>) {
   writeFileSync(DEBUG_FILE, JSON.stringify([...users], null, 2));
 }
 
+// --- All topics (cross-user) ---
+
+function getAllTopics(): { forumGroupTitles: Record<string, string>; topics: TopicEntry[] } | null {
+  if (!existsSync(SESSIONS_DB)) return null;
+  const db = new Database(SESSIONS_DB, { readonly: true });
+  try {
+    db.exec("PRAGMA busy_timeout = 3000");
+    const userRows = db.query<{ id: string; forum_group_titles: string | null }, []>(
+      "SELECT id, forum_group_titles FROM users"
+    ).all();
+    const titleMap: Record<string, string> = {};
+    for (const u of userRows) {
+      if (u.forum_group_titles) {
+        try { const t = JSON.parse(u.forum_group_titles); Object.assign(titleMap, t); } catch { /* empty */ }
+      }
+    }
+    const topicRows = db.query<{
+      name: string; message_thread_id: number; forum_group_id: number;
+      session_id: string | null; created_at: string; description: string | null;
+      model: string | null; cwd: string | null; effort: string | null;
+    }, []>("SELECT name, message_thread_id, forum_group_id, session_id, created_at, description, model, cwd, effort FROM topics ORDER BY forum_group_id, name").all();
+
+    const topics: TopicEntry[] = topicRows.map((row) => ({
+      name: row.name,
+      messageThreadId: row.message_thread_id,
+      forumGroupId: row.forum_group_id,
+      sessionId: row.session_id ?? "",
+      createdAt: row.created_at,
+      ...(row.description && { description: row.description }),
+      ...(row.model && { model: row.model }),
+      ...(row.cwd && { cwd: row.cwd }),
+      ...(row.effort && { effort: row.effort as TopicEntry['effort'] }),
+    }));
+    return { forumGroupTitles: titleMap, topics };
+  } finally { db.close(); }
+}
+
 // --- MCP Server ---
 
 const server = new McpServer({
@@ -171,7 +208,7 @@ const server = new McpServer({
 
 server.tool(
   "list_topics",
-  "List all forum topics (Claude sessions) for the user with their status and system prompts.",
+  "List all forum topics (Claude sessions) across all groups with their status, cwd, model, and effort.",
   {},
   async () => {
     const config = getUserConfig();
@@ -181,7 +218,8 @@ server.tool(
       };
     }
 
-    if (Object.keys(config.topics).length === 0) {
+    const all = getAllTopics();
+    if (!all || all.topics.length === 0) {
       const groupList = config.forumGroupIds.map((gid) => {
         const title = config.forumGroupTitles[String(gid)] || gid;
         return `  - ${title} (${gid})`;
@@ -192,18 +230,34 @@ server.tool(
     }
 
     // Group topics by forum group
-    const sections: string[] = [];
+    const grouped = new Map<number, typeof all.topics>();
+    for (const t of all.topics) {
+      const arr = grouped.get(t.forumGroupId) ?? [];
+      arr.push(t);
+      grouped.set(t.forumGroupId, arr);
+    }
+
+    // Ensure current user's empty groups appear in the listing
     for (const gid of config.forumGroupIds) {
-      const groupTitle = config.forumGroupTitles[String(gid)] || String(gid);
-      const groupTopics = Object.entries(config.topics).filter(([, t]) => t.forumGroupId === gid);
-      const lines = groupTopics.map(([name, t]) => {
-        const status = t.sessionId ? `active (${t.sessionId.slice(0, 8)})` : "new";
+      if (!grouped.has(gid)) grouped.set(gid, []);
+    }
+
+    const sections: string[] = [];
+    for (const [gid, topics] of grouped) {
+      const groupTitle = all.forumGroupTitles[String(gid)] || String(gid);
+      if (topics.length === 0) {
+        sections.push(`Group: ${groupTitle}\n    group_id: ${gid}\n  (no topics)`);
+        continue;
+      }
+      const lines = topics.map((t) => {
+        const status = t.sessionId ? `active` : "new";
         const model = t.model ? ` [${t.model}]` : " [default]";
-        const effort = t.effort ? ` [effort:${t.effort}]` : "";
-        const desc = t.description ? `\n    description: ${t.description.slice(0, 80)}${t.description.length > 80 ? "..." : ""}` : "";
-        return `  - ${name}: ${status}${model}${effort}${desc}`;
+        const effort = t.effort ? ` effort:${t.effort}` : "";
+        const cwdLine = t.cwd ? `\n      cwd: ${t.cwd}` : "";
+        const desc = t.description ? `\n      desc: ${t.description.slice(0, 80)}${t.description.length > 80 ? "..." : ""}` : "";
+        return `  - ${t.name} (thread:${t.messageThreadId})\n      status: ${status}${model}${effort}${cwdLine}${desc}`;
       });
-      sections.push(`Group: ${groupTitle} (${gid})\n${lines.length > 0 ? lines.join("\n") : "  (no topics)"}`);
+      sections.push(`Group: ${groupTitle}\n    group_id: ${gid}\n${lines.join("\n")}`);
     }
 
     return {

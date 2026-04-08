@@ -17,9 +17,9 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CRON_DIR = PROJECT_ROOT / "cron"
-LOGS_DIR = PROJECT_ROOT / "logs"
-USERS_DIR = LOGS_DIR / "users"
-SESSIONS_DB = LOGS_DIR / "sessions.db"
+DATA_DIR = PROJECT_ROOT / "data"
+USERS_DIR = DATA_DIR / "users"
+SESSIONS_DB = DATA_DIR / "sessions.db"
 
 
 def user_dir(user_id: str) -> Path:
@@ -104,18 +104,16 @@ def write_outbox(user_id: str, topic: str, cron_name: str, message: str, files: 
     out_dir = outbox_dir(user_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     outbox_file = out_dir / "pending.jsonl"
+    actual_message = "\n\n".join(session_texts) if session_texts else message
     entry = {
         "userId": user_id,
         "topic": topic,
         "cronName": cron_name,
-        "message": message,
+        "message": actual_message,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if files:
         entry["files"] = files
-    if session_texts:
-        entry["sessionTexts"] = session_texts
-        entry["sessionInject"] = True
     if new_cron_session_id:
         entry["newCronSessionId"] = new_cron_session_id
     with open(outbox_file, "a") as f:
@@ -287,7 +285,7 @@ def _run_job(args, script_path):
     write_outbox(args.user_id, args.topic, args.cron_name, response, unique_files or None, session_texts or None, new_session_id or None)
     print(f"[runner] Done. Output written to outbox for topic '{args.topic}'" +
           (f" ({len(unique_files)} files: {unique_files})" if unique_files else " (no files)") +
-          (f" (session_inject: {len(session_texts)} texts)" if session_texts else ""))
+          (f" ({len(session_texts)} session texts merged)" if session_texts else ""))
 
 
 if __name__ == "__main__":

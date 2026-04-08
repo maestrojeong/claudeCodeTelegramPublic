@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "bot": "docker compose up -d && bun run src/telegram/bot.ts",
+    "bot": "bun run src/telegram/bot.ts",
     "lint": "eslint"
   },
   "dependencies": {

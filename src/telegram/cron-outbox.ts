@@ -4,7 +4,6 @@ import { sendMsg, splitMessage, sendFileToChat } from "@/telegram/helpers";
 import { USERS_LOG_DIR } from "@/core/config";
 import { getUserConfig, getTopicByName, setCronSessionForTopic } from "@/telegram/forum-sessions";
 import { logger } from "@/core/logger";
-import { getSessionInjectHandler } from "@/telegram/outbox-types";
 import { acquireJsonlLines, cleanupProcessing } from "@/telegram/outbox-utils";
 
 export async function flushCronOutbox() {
@@ -61,35 +60,12 @@ export async function flushCronOutbox() {
 
         const threadOpts = { message_thread_id: topic.messageThreadId };
 
-        // Session inject: route through user's topic session
-        const _sessionInjectHandler = getSessionInjectHandler();
-        const sessionTexts = entry.sessionTexts as string[] | undefined;
-        if (entry.sessionInject && sessionTexts?.length && _sessionInjectHandler && topic.sessionId) {
-          const prompt = sessionTexts.join("\n\n");
-          await _sessionInjectHandler({
-            userId,
-            topicName,
-            sessionId: topic.sessionId as string,
-            prompt,
-            messageThreadId: topic.messageThreadId,
-            forumGroupId: topic.forumGroupId,
-            from: "user",
-            depth: 0,
-            chain: [topicName],
-          });
-        } else {
-          const text = `[cron: ${entry.cronName || "unknown"}]\n${entry.message}`;
-          for (const chunk of splitMessage(text)) {
-            await sendMsg(topic.forumGroupId, chunk, threadOpts);
-          }
-        }
-
         // Update cronSessionId via cache (prevents overwrite race condition)
         if (entry.newCronSessionId) {
           setCronSessionForTopic(userId, topicName, entry.newCronSessionId as string);
         }
 
-        // Send files if any
+        // Send files first, then text message
         const entryFiles = (entry.files || []) as string[];
         const allowedDir = join(USERS_LOG_DIR, String(userId));
         for (const fp of entryFiles) {
@@ -107,6 +83,12 @@ export async function flushCronOutbox() {
           } catch (fileErr) {
             logger.error({ err: fileErr, file: fp }, "cron-outbox: Failed to send file");
           }
+        }
+
+        // Send text message
+        const text = `[cron: ${entry.cronName || "unknown"}]\n${entry.message}`;
+        for (const chunk of splitMessage(text)) {
+          await sendMsg(topic.forumGroupId, chunk, threadOpts);
         }
       } catch (err) {
         const nextRetry = retryCount + 1;

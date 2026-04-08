@@ -177,6 +177,7 @@ export function clearQueryState(userId: number, topicName: string) {
 export function cleanStaleQueryStates() {
   const now = Date.now();
   try {
+    mkdirSync(USERS_LOG_DIR, { recursive: true });
     const userDirs = readdirSync(USERS_LOG_DIR, { withFileTypes: true });
     for (const dir of userDirs) {
       if (!dir.isDirectory()) continue;
