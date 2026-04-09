@@ -29,21 +29,4 @@ if (ADMIN_USERS.size === 0) {
 
 export const bot = new TelegramBot(TOKEN, { polling: true });
 
-// --- Bot identity (resolved at startup via getMe) ---
-// These are populated by initBotIdentity() before message polling starts handling traffic.
-// Other modules (mention detection, desk routing) import these.
-export let BOT_ID: number = 0;
-export let BOT_USERNAME: string = "";
-
-export async function initBotIdentity(): Promise<void> {
-  const me = await bot.getMe();
-  BOT_ID = me.id;
-  BOT_USERNAME = me.username || "";
-  if (!BOT_USERNAME) {
-    logger.fatal("getMe() returned no username — bot must have a username for mention detection");
-    process.exit(1);
-  }
-  logger.info({ botId: BOT_ID, botUsername: BOT_USERNAME, serverName: SERVER_NAME }, "Bot identity resolved");
-}
-
 logger.info({ adminUsers: [...ADMIN_USERS], serverName: SERVER_NAME }, "Telegram bot started");
