@@ -72,7 +72,7 @@ user_{userId}/
 ### 정기 작업 (Cron)
 - **pm2 + uv 기반 cron**: 세션과 독립적으로 영속 실행
 - 스크립트 위치: `~/claudeCodeTelegram/cron/`
-- 실행 cwd: `~/claude-code-workspace/user_{userId}/`
+- 실행 cwd: 프로젝트 루트 (`PROJECT_ROOT`)
 - MCP 도구:
   - `mcp__cron-manager__cron_create` — cron job 생성 (name, script, cron, topic)
   - `mcp__cron-manager__cron_list` — 현재 cron job 목록
