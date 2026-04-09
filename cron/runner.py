@@ -162,7 +162,6 @@ def _run_job(args, script_path):
             capture_output=True,
             text=True,
             timeout=3600,
-            cwd=str(Path.home() / "claude-code-workspace" / f"user_{args.user_id}"),
         )
         prompt = result.stdout.strip()
         if not prompt:
@@ -214,7 +213,6 @@ def _run_job(args, script_path):
     files: list[str] = []
     session_texts: list[str] = []
     new_session_id: str | None = None
-    work_dir = str(Path.home() / "claude-code-workspace" / f"user_{args.user_id}")
 
     try:
         proc = subprocess.Popen(
@@ -222,7 +220,6 @@ def _run_job(args, script_path):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            cwd=work_dir,
         )
         assert proc.stdout is not None
 
