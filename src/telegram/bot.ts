@@ -37,6 +37,7 @@ interface MediaGroupEntry {
   timer: ReturnType<typeof setTimeout>;
   chatId: number;
   userId: number;
+  topicMatch: ReturnType<typeof findUserByGroupAndThread>;
 }
 
 const mediaGroupBuffer = new Map<string, MediaGroupEntry>();
@@ -46,7 +47,7 @@ async function flushMediaGroup(mediaGroupId: string) {
   if (!entry) return;
   mediaGroupBuffer.delete(mediaGroupId);
 
-  const { messages, chatId, userId } = entry;
+  const { messages, chatId, userId, topicMatch } = entry;
   logger.info(
     { mediaGroupId, messageCount: messages.length, userId },
     "Media group flush: processing batched messages as single prompt",
@@ -61,24 +62,26 @@ async function flushMediaGroup(mediaGroupId: string) {
     return;
   }
 
-  await routeMessage(messages[0], chatId, userId, text);
+  await routeMessage(messages[0], chatId, userId, text, topicMatch);
 }
 
 /**
  * Routes a fully-built prompt to the correct handler (supergroup forum or DM).
+ *
+ * `topicMatch` is the supergroup topic lookup result already resolved by the caller
+ * in bot.on. It is required (and non-null) for supergroup messages, and ignored
+ * (`null`) for DMs. Passing it through avoids repeating the SQLite lookup here.
  */
-async function routeMessage(msg: TelegramBot.Message, chatId: number, userId: number, text: string) {
+async function routeMessage(
+  msg: TelegramBot.Message,
+  chatId: number,
+  userId: number,
+  text: string,
+  topicMatch: ReturnType<typeof findUserByGroupAndThread>,
+) {
   // --- Supergroup forum routing ---
   if (msg.chat.type === "supergroup") {
-    if (!msg.message_thread_id) return;
-
-    const groupId = msg.chat.id;
-    const threadId = msg.message_thread_id;
-    const match = findUserByGroupAndThread(groupId, threadId);
-    if (!match) {
-      logger.debug({ groupId, threadId, userId }, "Message in unregistered forum topic, ignoring");
-      return;
-    }
+    if (!topicMatch || !msg.message_thread_id) return;
 
     const sender = msg.from;
     const senderLabel = sender
@@ -87,18 +90,18 @@ async function routeMessage(msg: TelegramBot.Message, chatId: number, userId: nu
     const prompt = `[from: ${senderLabel} (id:${userId})]\n${text}`;
 
     await handleClaudeQuery({
-      chatId: groupId,
-      userId: match.userId,
+      chatId: msg.chat.id,
+      userId: topicMatch.userId,
       senderId: userId,
-      topicName: match.topic.name,
-      sessionId: match.topic.sessionId || null,
+      topicName: topicMatch.topic.name,
+      sessionId: topicMatch.topic.sessionId || null,
       prompt,
-      messageThreadId: threadId,
+      messageThreadId: msg.message_thread_id,
       systemPrompt: buildTopicSystemPrompt({
-        description: getTopicDescription(match.userId, match.topic.name),
+        description: getTopicDescription(topicMatch.userId, topicMatch.topic.name),
       }),
-      model: getTopicModel(match.userId, match.topic.name) || undefined,
-      effort: match.topic.effort,
+      model: getTopicModel(topicMatch.userId, topicMatch.topic.name) || undefined,
+      effort: topicMatch.topic.effort,
     });
     return;
   }
@@ -244,6 +247,7 @@ bot.on("message", async (msg) => {
         timer: setTimeout(() => flushMediaGroup(mediaGroupId).catch((e) => logger.error({ err: e, mediaGroupId }, "flushMediaGroup failed")), MEDIA_GROUP_WAIT_MS),
         chatId,
         userId,
+        topicMatch,
       });
     }
     return;
@@ -255,7 +259,7 @@ bot.on("message", async (msg) => {
   const text = await buildPromptFromMessage(msg, chatId, userId);
   if (!text) return;
 
-  await routeMessage(msg, chatId, userId, text);
+  await routeMessage(msg, chatId, userId, text, topicMatch);
 });
 
 // --- Cleanup on exit ---
