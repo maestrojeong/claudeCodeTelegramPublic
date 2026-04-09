@@ -17,6 +17,7 @@ import {
 } from "@/telegram/forum-sessions";
 import { logger } from "@/core/logger";
 import { deleteTopicWithArchive } from "@/core/topic-lifecycle";
+import { withTopicPrefix } from "@/core/config";
 
 interface ForumTopic {
   message_thread_id: number;
@@ -192,12 +193,14 @@ async function handleDisconnectCommand(chatId: number, userId: number, text: str
 
 // --- /new ---
 async function handleNewCommand(chatId: number, userId: number, text: string): Promise<void> {
-  const topicName = text.split(/\s+/).slice(1).join(" ").trim();
-  if (!topicName) {
+  const rawName = text.split(/\s+/).slice(1).join(" ").trim();
+  if (!rawName) {
     clearDmSessionId(userId);
     await sendMsg(chatId, "1:1 채팅 세션을 초기화했습니다. 새로운 대화를 시작하세요!");
     return;
   }
+  // User can pass either "foo" or "[srv] foo"; we always store with the prefix.
+  const topicName = withTopicPrefix(rawName);
 
   const groupIds = getForumGroupIds(userId);
   if (groupIds.length === 0) {
@@ -229,7 +232,7 @@ async function handleNewCommand(chatId: number, userId: number, text: string): P
     const groupNote = groupIds.length > 1 ? `\n그룹: ${groupTitle} (${targetGroupId})` : "";
     await sendMsg(chatId,
       `✅ "${topicName}" 세션을 생성했습니다.${groupNote}\n\n` +
-      `��로가기: ${link}`
+      `바로가기: ${link}`
     );
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : "unknown";
@@ -280,11 +283,12 @@ async function handleListCommand(chatId: number, userId: number): Promise<void> 
 
 // --- /del ---
 async function handleDelCommand(chatId: number, userId: number, text: string): Promise<void> {
-  const topicName = text.split(/\s+/).slice(1).join(" ").trim();
-  if (!topicName) {
+  const rawName = text.split(/\s+/).slice(1).join(" ").trim();
+  if (!rawName) {
     await sendMsg(chatId, "사용법: /del <세션이름>");
     return;
   }
+  const topicName = withTopicPrefix(rawName);
 
   const topic = getTopicByName(userId, topicName);
   if (!topic) {

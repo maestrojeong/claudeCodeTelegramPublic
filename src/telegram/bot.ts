@@ -1,6 +1,6 @@
 import TelegramBot from "node-telegram-bot-api";
 import { join } from "path";
-import { bot, ADMIN_USERS } from "@/telegram/client";
+import { bot, ADMIN_USERS, initBotIdentity } from "@/telegram/client";
 import { sendMsg } from "@/telegram/helpers";
 import { initUserWorkspace, syncMetaClaudeMd, syncMetaAgents, cleanStaleQueryStates } from "@/telegram/workspace";
 import { buildPromptFromMessage, buildPromptFromMediaGroup } from "@/telegram/attachments";
@@ -15,6 +15,8 @@ import {
   getTopicModel,
   flushSessionCache,
 } from "@/telegram/forum-sessions";
+import { runServerMigration } from "@/telegram/server-migration";
+import { pushExternalMessage, isMentionForThisBot, handleExternalMention } from "@/telegram/desk";
 import { USERS_LOG_DIR, DM_SYSTEM_PROMPT, buildTopicSystemPrompt } from "@/core/config";
 import { logger } from "@/core/logger";
 
@@ -175,6 +177,12 @@ bot.on("polling_error", async (err: any) => {
   }
 });
 
+// --- Resolve bot identity (BOT_ID, BOT_USERNAME) before any handler runs ---
+await initBotIdentity();
+
+// --- One-time D1 migration: tag legacy topics with this server's SERVER_NAME ---
+await runServerMigration();
+
 // --- Sync meta agents and CLAUDE.md to all existing users at startup ---
 syncMetaAgents();
 syncMetaClaudeMd();
@@ -194,6 +202,10 @@ bot.on("message", async (msg) => {
   if (!userId) return;
   const isAdmin = ADMIN_USERS.has(userId);
 
+  // Bot-authored messages: never recurse on our own / other bots' output. We may
+  // revisit this when cross-server session-comm via Telegram is implemented.
+  if (msg.from?.is_bot) return;
+
   if (isAdmin) {
     initUserWorkspace(userId, msg.from);
   } else if (msg.chat.type === "private") {
@@ -209,11 +221,23 @@ bot.on("message", async (msg) => {
     if (isAdmin && await handleForumConnect(msg)) return;
     if (!msg.message_thread_id) return;
 
-    const commThreadId = getCommunicateThreadId(userId);
+    const commThreadId = isAdmin ? getCommunicateThreadId(userId) : null;
     if (commThreadId && msg.message_thread_id === commThreadId) return;
 
     topicMatch = findUserByGroupAndThread(msg.chat.id, msg.message_thread_id);
-    if (!topicMatch) return;
+    if (!topicMatch) {
+      // Foreign topic (not owned by this server). Always buffer for desk context;
+      // route to desk only when this bot is mentioned (or replied to).
+      pushExternalMessage(msg);
+      if (isMentionForThisBot(msg)) {
+        try {
+          await handleExternalMention(msg);
+        } catch (e) {
+          logger.error({ err: e, groupId: msg.chat.id, threadId: msg.message_thread_id }, "Desk: handleExternalMention failed");
+        }
+      }
+      return;
+    }
   } else if (msg.chat.type !== "private") {
     return;
   }

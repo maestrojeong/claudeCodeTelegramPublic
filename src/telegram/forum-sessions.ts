@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync } from "fs";
 import { dirname } from "path";
 import { logger } from "@/core/logger";
-import { SESSIONS_DB } from "@/core/config";
+import { SESSIONS_DB, SERVER_NAME } from "@/core/config";
 import type { EffortLevel } from "@/core/types";
 
 /** Listener called when a user disconnects a forum group. Registered externally to avoid circular deps. */
@@ -48,6 +48,8 @@ db.exec(`
 try { db.exec("ALTER TABLE topics ADD COLUMN mcp_enabled TEXT"); } catch {}
 try { db.exec("ALTER TABLE topics ADD COLUMN mcp_extra TEXT"); } catch {}
 try { db.exec("ALTER TABLE topics ADD COLUMN cwd TEXT"); } catch {}
+// server_name: which bot/server owns this topic. Backfilled by runStartupServerMigration().
+try { db.exec("ALTER TABLE topics ADD COLUMN server_name TEXT"); } catch {}
 // Rename system_prompt_extra → description
 {
   const cols = db.query<{ name: string }, []>("PRAGMA table_info(topics)").all();
@@ -147,6 +149,42 @@ export function flushSessionCache() {
   db.close();
 }
 
+// --- Server migration helpers (called from bot.ts startup) ---
+
+/** Topics with NULL server_name (legacy rows from before this server's prefix system). */
+export function getUnmigratedTopics(): { userId: number; forumGroupId: number; name: string; messageThreadId: number }[] {
+  const rows = db.query<{ user_id: string; forum_group_id: number; name: string; message_thread_id: number }, []>(
+    "SELECT user_id, forum_group_id, name, message_thread_id FROM topics WHERE server_name IS NULL"
+  ).all();
+  return rows.map(r => ({
+    userId: Number(r.user_id),
+    forumGroupId: r.forum_group_id,
+    name: r.name,
+    messageThreadId: r.message_thread_id,
+  }));
+}
+
+/**
+ * Mark a legacy topic as owned by this server, optionally renaming it (DB only).
+ * Used during D1 migration after Telegram editForumTopic succeeds.
+ */
+export function migrateTopicToThisServer(userId: number, oldName: string, newName: string): void {
+  db.transaction(() => {
+    // If newName == oldName, just set server_name. Otherwise rename + set.
+    if (newName === oldName) {
+      db.query("UPDATE topics SET server_name = ? WHERE user_id = ? AND name = ? AND server_name IS NULL").run(
+        SERVER_NAME, String(userId), oldName
+      );
+    } else {
+      // Rename: handle (user_id, name) UNIQUE constraint by deleting any conflicting row first.
+      db.query("DELETE FROM topics WHERE user_id = ? AND name = ?").run(String(userId), newName);
+      db.query("UPDATE topics SET name = ?, server_name = ? WHERE user_id = ? AND name = ? AND server_name IS NULL").run(
+        newName, SERVER_NAME, String(userId), oldName
+      );
+    }
+  })();
+}
+
 // --- Helpers for JSON array/object columns ---
 
 function parseGroupIds(raw: string): number[] {
@@ -159,12 +197,14 @@ function parseGroupTitles(raw: string): Record<string, string> {
 
 // --- User config ---
 
-/** Get user's forum config */
+/** Get user's forum config (only topics owned by this server) */
 export function getUserConfig(userId: number): UserForumConfig | null {
   const user = db.query<UserRow, string>("SELECT * FROM users WHERE id = ?").get(String(userId));
   if (!user) return null;
 
-  const topicRows = db.query<TopicRow, string>("SELECT * FROM topics WHERE user_id = ?").all(String(userId));
+  const topicRows = db.query<TopicRow, [string, string]>(
+    "SELECT * FROM topics WHERE user_id = ? AND server_name = ?"
+  ).all(String(userId), SERVER_NAME);
   const topics: { [name: string]: ForumTopicInfo } = {};
   for (const row of topicRows) {
     topics[row.name] = rowToTopic(row);
@@ -258,20 +298,21 @@ export function removeForumGroup(userId: number, groupId: number): boolean {
 
 // --- Topic management ---
 
-/** Add a topic for a user in a specific group */
+/** Add a topic for a user in a specific group (always tagged with this server's SERVER_NAME) */
 export function addTopic(userId: number, groupId: number, name: string, messageThreadId: number, sessionId?: string, createdAt?: string) {
   // Ensure user exists
   db.query(`INSERT INTO users (id) VALUES (?) ON CONFLICT(id) DO NOTHING`).run(String(userId));
 
   db.query(`
-    INSERT INTO topics (user_id, forum_group_id, name, message_thread_id, session_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO topics (user_id, forum_group_id, name, message_thread_id, session_id, created_at, server_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id, name) DO UPDATE SET
       forum_group_id = excluded.forum_group_id,
       message_thread_id = excluded.message_thread_id,
       session_id = excluded.session_id,
-      created_at = excluded.created_at
-  `).run(String(userId), groupId, name, messageThreadId, sessionId ?? null, createdAt ?? new Date().toISOString());
+      created_at = excluded.created_at,
+      server_name = excluded.server_name
+  `).run(String(userId), groupId, name, messageThreadId, sessionId ?? null, createdAt ?? new Date().toISOString(), SERVER_NAME);
 }
 
 /** Remove a topic */
@@ -279,27 +320,27 @@ export function removeTopic(userId: number, name: string) {
   db.query("DELETE FROM topics WHERE user_id = ? AND name = ?").run(String(userId), name);
 }
 
-/** Get topic by name */
+/** Get topic by name (this server only) */
 export function getTopicByName(userId: number, name: string): ForumTopicInfo | null {
-  const row = db.query<TopicRow, [string, string]>(
-    "SELECT * FROM topics WHERE user_id = ? AND name = ?"
-  ).get(String(userId), name);
+  const row = db.query<TopicRow, [string, string, string]>(
+    "SELECT * FROM topics WHERE user_id = ? AND name = ? AND server_name = ?"
+  ).get(String(userId), name, SERVER_NAME);
   return row ? rowToTopic(row) : null;
 }
 
-/** Get topic by thread ID */
+/** Get topic by thread ID (this server only) */
 export function getTopicByThreadId(userId: number, threadId: number): ForumTopicInfo | null {
-  const row = db.query<TopicRow, [string, number]>(
-    "SELECT * FROM topics WHERE user_id = ? AND message_thread_id = ?"
-  ).get(String(userId), threadId);
+  const row = db.query<TopicRow, [string, number, string]>(
+    "SELECT * FROM topics WHERE user_id = ? AND message_thread_id = ? AND server_name = ?"
+  ).get(String(userId), threadId, SERVER_NAME);
   return row ? rowToTopic(row) : null;
 }
 
-/** Reverse lookup: find user by group ID and thread ID */
+/** Reverse lookup: find user by group ID and thread ID — only matches topics owned by this server. */
 export function findUserByGroupAndThread(groupId: number, threadId: number): { userId: number; topic: ForumTopicInfo } | null {
-  const row = db.query<TopicRow, [number, number]>(
-    "SELECT * FROM topics WHERE forum_group_id = ? AND message_thread_id = ?"
-  ).get(groupId, threadId);
+  const row = db.query<TopicRow, [number, number, string]>(
+    "SELECT * FROM topics WHERE forum_group_id = ? AND message_thread_id = ? AND server_name = ?"
+  ).get(groupId, threadId, SERVER_NAME);
   if (!row) return null;
   return { userId: Number(row.user_id), topic: rowToTopic(row) };
 }
@@ -341,19 +382,19 @@ export function clearSessionForTopic(userId: number, topicName: string) {
   );
 }
 
-/** Get all topic names for a user */
+/** Get all topic names for a user (this server only) */
 export function getTopicNames(userId: number): string[] {
-  const rows = db.query<{ name: string }, string>(
-    "SELECT name FROM topics WHERE user_id = ?"
-  ).all(String(userId));
+  const rows = db.query<{ name: string }, [string, string]>(
+    "SELECT name FROM topics WHERE user_id = ? AND server_name = ?"
+  ).all(String(userId), SERVER_NAME);
   return rows.map(r => r.name);
 }
 
-/** Get all topic names for a specific group */
+/** Get all topic names for a specific group (this server only) */
 export function getTopicNamesForGroup(userId: number, groupId: number): string[] {
-  const rows = db.query<{ name: string }, [string, number]>(
-    "SELECT name FROM topics WHERE user_id = ? AND forum_group_id = ?"
-  ).all(String(userId), groupId);
+  const rows = db.query<{ name: string }, [string, number, string]>(
+    "SELECT name FROM topics WHERE user_id = ? AND forum_group_id = ? AND server_name = ?"
+  ).all(String(userId), groupId, SERVER_NAME);
   return rows.map(r => r.name);
 }
 
@@ -481,17 +522,19 @@ export function updateTopicThreadId(userId: number, topicName: string, newThread
   );
 }
 
-/** Get all topics for a user */
+/** Get all topics for a user (this server only) */
 export function getAllTopics(userId: number): ForumTopicInfo[] {
-  const rows = db.query<TopicRow, string>("SELECT * FROM topics WHERE user_id = ?").all(String(userId));
+  const rows = db.query<TopicRow, [string, string]>(
+    "SELECT * FROM topics WHERE user_id = ? AND server_name = ?"
+  ).all(String(userId), SERVER_NAME);
   return rows.map(rowToTopic);
 }
 
-/** Get all topics for a specific group */
+/** Get all topics for a specific group (this server only) */
 export function getAllTopicsForGroup(userId: number, groupId: number): ForumTopicInfo[] {
-  const rows = db.query<TopicRow, [string, number]>(
-    "SELECT * FROM topics WHERE user_id = ? AND forum_group_id = ?"
-  ).all(String(userId), groupId);
+  const rows = db.query<TopicRow, [string, number, string]>(
+    "SELECT * FROM topics WHERE user_id = ? AND forum_group_id = ? AND server_name = ?"
+  ).all(String(userId), groupId, SERVER_NAME);
   return rows.map(rowToTopic);
 }
 

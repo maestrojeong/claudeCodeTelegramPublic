@@ -7,7 +7,7 @@ import { promisify } from "util";
 import { existsSync } from "fs";
 import { Database } from "bun:sqlite";
 import { resolve } from "path";
-import { PROJECT_ROOT } from "@/core/config";
+import { PROJECT_ROOT, SERVER_NAME } from "@/core/config";
 
 const execFileAsync = promisify(execFile);
 
@@ -69,9 +69,9 @@ function getUserTopics(uid: string): string[] {
   const db = new Database(SESSIONS_DB, { readonly: true });
   try {
     db.exec("PRAGMA busy_timeout = 3000");
-    const rows = db.query<{ name: string }, string>(
-      "SELECT name FROM topics WHERE user_id = ?"
-    ).all(uid);
+    const rows = db.query<{ name: string }, [string, string]>(
+      "SELECT name FROM topics WHERE user_id = ? AND server_name = ?"
+    ).all(uid, SERVER_NAME);
     return rows.map(r => r.name);
   } catch {
     return [];

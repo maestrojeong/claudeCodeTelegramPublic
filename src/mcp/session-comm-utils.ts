@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { join, resolve } from "path";
 import { homedir } from "os";
 import type { Options } from "@anthropic-ai/claude-agent-sdk";
-import { PROJECT_ROOT, getCleanEnv, PROGRESS_DIR as CONFIG_PROGRESS_DIR, SESSION_INBOX_DIR, DEBUG_FILE, SESSIONS_DB as CONFIG_SESSIONS_DB } from "@/core/config";
+import { PROJECT_ROOT, getCleanEnv, PROGRESS_DIR as CONFIG_PROGRESS_DIR, SESSION_INBOX_DIR, DEBUG_FILE, SESSIONS_DB as CONFIG_SESSIONS_DB, SERVER_NAME } from "@/core/config";
 import { getForkMcpServers } from "@/core/mcp-config";
 export { SESSION_INBOX_DIR };
 import type { QueryState } from "@/core/types";
@@ -70,9 +70,9 @@ export function getTopicsForUser(): { [name: string]: TopicEntry } {
       message_thread_id: number;
       description: string | null;
       cwd: string | null;
-    }, string>(
-      "SELECT name, session_id, cron_session_id, message_thread_id, description, cwd FROM topics WHERE user_id = ?"
-    ).all(userId);
+    }, [string, string]>(
+      "SELECT name, session_id, cron_session_id, message_thread_id, description, cwd FROM topics WHERE user_id = ? AND server_name = ?"
+    ).all(userId, SERVER_NAME);
     const result: { [name: string]: TopicEntry } = {};
     for (const row of rows) {
       result[row.name] = {

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { writeFileSync, readFileSync, appendFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, statSync, copyFileSync } from "fs";
 import { join, basename, dirname } from "path";
 import { Database } from "bun:sqlite";
-import { USERS_LOG_DIR, SESSIONS_DB, DM_CMD_DIR, DM_RESP_DIR, DEBUG_FILE } from "@/core/config";
+import { USERS_LOG_DIR, SESSIONS_DB, DM_CMD_DIR, DM_RESP_DIR, DEBUG_FILE, SERVER_NAME } from "@/core/config";
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -63,7 +63,7 @@ function getUserConfig(): UserConfig | null {
       effort: string | null;
       mcp_enabled: string | null;
       mcp_extra: string | null;
-    }, string>("SELECT name, message_thread_id, forum_group_id, session_id, created_at, description, model, cwd, effort, mcp_enabled, mcp_extra FROM topics WHERE user_id = ?").all(userId);
+    }, [string, string]>("SELECT name, message_thread_id, forum_group_id, session_id, created_at, description, model, cwd, effort, mcp_enabled, mcp_extra FROM topics WHERE user_id = ? AND server_name = ?").all(userId, SERVER_NAME);
 
     const topics: { [name: string]: TopicEntry } = {};
     for (const row of topicRows) {
@@ -182,7 +182,7 @@ function getAllTopics(): { forumGroupTitles: Record<string, string>; topics: Top
       name: string; message_thread_id: number; forum_group_id: number;
       session_id: string | null; created_at: string; description: string | null;
       model: string | null; cwd: string | null; effort: string | null;
-    }, []>("SELECT name, message_thread_id, forum_group_id, session_id, created_at, description, model, cwd, effort FROM topics ORDER BY forum_group_id, name").all();
+    }, string>("SELECT name, message_thread_id, forum_group_id, session_id, created_at, description, model, cwd, effort FROM topics WHERE server_name = ? ORDER BY forum_group_id, name").all(SERVER_NAME);
 
     const topics: TopicEntry[] = topicRows.map((row) => ({
       name: row.name,

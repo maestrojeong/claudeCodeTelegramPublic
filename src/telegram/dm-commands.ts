@@ -15,7 +15,7 @@ import {
 } from "@/telegram/forum-sessions";
 import { logger } from "@/core/logger";
 import type { EffortLevel } from "@/core/types";
-import { DM_CMD_DIR, DM_RESP_DIR } from "@/core/config";
+import { DM_CMD_DIR, DM_RESP_DIR, withTopicPrefix } from "@/core/config";
 import { ForumTopic, getSessionInjectHandler } from "@/telegram/outbox-types";
 import { deleteTopicWithArchive } from "@/core/topic-lifecycle";
 import { acquireJsonlLines, cleanupProcessing } from "@/telegram/outbox-utils";
@@ -68,10 +68,11 @@ export async function flushDmCommands() {
             continue;
           }
           try {
-            const result = await bot.createForumTopic(targetGroupId, cmd.params.name) as unknown as ForumTopic;
-            addTopic(uid, targetGroupId, cmd.params.name, result.message_thread_id);
+            // Auto-prefix with this server's [SERVER_NAME]
+            const topicName = withTopicPrefix(cmd.params.name as string);
+            const result = await bot.createForumTopic(targetGroupId, topicName) as unknown as ForumTopic;
+            addTopic(uid, targetGroupId, topicName, result.message_thread_id);
             // Apply initial config if provided
-            const topicName = cmd.params.name as string;
             const mcpEnabled = cmd.params.mcp_enabled as string[] | null | undefined;
             if (mcpEnabled !== undefined) {
               const required = ["session-comm", "send-file", "cron-manager"];
@@ -93,7 +94,8 @@ export async function flushDmCommands() {
             writeResponse(respFile, { success: false, error: "No config" });
             continue;
           }
-          const topic = getTopicByName(uid, cmd.params.name);
+          const lookupName = withTopicPrefix(cmd.params.name as string);
+          const topic = getTopicByName(uid, lookupName);
           if (!topic) {
             writeResponse(respFile, { success: false, error: "Topic not found" });
             continue;
@@ -101,7 +103,7 @@ export async function flushDmCommands() {
           try {
             const result = await deleteTopicWithArchive({
               userId: uid,
-              topicName: cmd.params.name,
+              topicName: lookupName,
               sessionId: topic.sessionId || null,
               forumGroupId: topic.forumGroupId,
               messageThreadId: topic.messageThreadId,
@@ -111,19 +113,19 @@ export async function flushDmCommands() {
             writeResponse(respFile, { success: false, error: e instanceof Error ? e.message : "unknown" });
           }
         } else if (cmd.action === "set_description") {
-          const ok = setTopicDescription(uid, cmd.params.topic as string, cmd.params.description as string);
+          const ok = setTopicDescription(uid, withTopicPrefix(cmd.params.topic as string), cmd.params.description as string);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_cwd") {
           const cwd = cmd.params.cwd as string | null;
-          const ok = setTopicCwd(uid, cmd.params.topic as string, cwd);
+          const ok = setTopicCwd(uid, withTopicPrefix(cmd.params.topic as string), cwd);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_model") {
           const model = cmd.params.model === "default" ? null : cmd.params.model as string;
-          const ok = setTopicModel(uid, cmd.params.topic as string, model);
+          const ok = setTopicModel(uid, withTopicPrefix(cmd.params.topic as string), model);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_effort") {
           const effort = cmd.params.effort === "default" ? null : cmd.params.effort as EffortLevel;
-          const ok = setTopicEffort(uid, cmd.params.topic as string, effort);
+          const ok = setTopicEffort(uid, withTopicPrefix(cmd.params.topic as string), effort);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_mcp_enabled") {
           const rawEnabled = cmd.params.enabled as string[] | null;
@@ -131,10 +133,10 @@ export async function flushDmCommands() {
           const safeEnabled = rawEnabled === null
             ? null
             : [...new Set([...rawEnabled, ...required.filter(r => !rawEnabled.includes(r))])];
-          const ok = setTopicMcpEnabled(uid, cmd.params.topic as string, safeEnabled);
+          const ok = setTopicMcpEnabled(uid, withTopicPrefix(cmd.params.topic as string), safeEnabled);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else if (cmd.action === "set_topic_mcp_extra") {
-          const ok = setTopicMcpExtra(uid, cmd.params.topic as string, cmd.params.extra as Record<string, unknown>);
+          const ok = setTopicMcpExtra(uid, withTopicPrefix(cmd.params.topic as string), cmd.params.extra as Record<string, unknown>);
           writeResponse(respFile, { success: ok, error: ok ? undefined : "Topic not found" });
         } else {
           writeResponse(respFile, { success: false, error: `Unknown action: ${cmd.action}` });

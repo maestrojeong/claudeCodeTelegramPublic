@@ -11,6 +11,23 @@ export const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..
 
 export const CLAUDE_EXECUTABLE = resolve(HOME, ".local/bin/claude");
 
+// --- Server identity ---
+// SERVER_NAME identifies this bot instance among other bots/servers sharing the same
+// supergroups. Used as a [prefix] on all forum topic names so each server can tell which
+// topics belong to it. Required: bot exits at startup if missing.
+export const SERVER_NAME = (process.env.SERVER_NAME || "").trim();
+
+/** Returns the prefix used to tag topics owned by this server, e.g. "[mac1] ". */
+export function topicPrefix(): string {
+  return `[${SERVER_NAME}] `;
+}
+
+/** Prepends the server prefix to a topic name if not already present. */
+export function withTopicPrefix(name: string): string {
+  const p = topicPrefix();
+  return name.startsWith(p) ? name : `${p}${name}`;
+}
+
 export const SEND_FILE_SERVER = resolve(PROJECT_ROOT, "src/mcp/send-file-server.ts");
 
 export const SESSION_COMM_SERVER = resolve(PROJECT_ROOT, "src/mcp/session-comm-server.ts");

@@ -101,6 +101,13 @@ interface OutputParams {
   model?: string;
   silent?: boolean;
   effort?: EffortLevel;
+  /**
+   * Mirror the final response to another chat/topic. Used by the desk handler
+   * to forward the bot's reply to the original external topic where the mention
+   * occurred. The desk topic still receives the full streaming flow; mirrorTo
+   * receives only the finalResponse text once it's complete.
+   */
+  mirrorTo?: { chatId: number; messageThreadId?: number };
 }
 
 interface SessionChainParams {
@@ -331,7 +338,7 @@ export async function handleClaudeQuery(params: HandleClaudeQueryParams) {
     const topicCwd = params.sessionType !== "dm" && params.sessionType !== "ephemeral"
       ? getTopicCwd(userId, topicName)
       : null;
-    const rawCwd = expandHome(params.cwd) || expandHome(topicCwd) || homedir();
+    const rawCwd = expandHome(params.cwd ?? null) || expandHome(topicCwd) || homedir();
     const userCwd = isAllowedCwd(rawCwd) ? rawCwd : homedir();
     if (rawCwd !== userCwd) {
       logger.warn({ userId, topicName, requestedCwd: rawCwd, fallbackCwd: userCwd }, "Blocked disallowed cwd, falling back to homedir");
@@ -490,6 +497,17 @@ export async function handleClaudeQuery(params: HandleClaudeQueryParams) {
       }
     } else if (debug) {
       await flushText();
+    }
+
+    // Mirror final response to an external chat/topic (desk → original mention).
+    if (params.mirrorTo && finalResponse && control.abortReason === AbortReason.None) {
+      const mirrorOpts: TelegramBot.SendMessageOptions = params.mirrorTo.messageThreadId
+        ? { message_thread_id: params.mirrorTo.messageThreadId } : {};
+      try {
+        await sendSplitMsg(params.mirrorTo.chatId, finalResponse, mirrorOpts);
+      } catch (e) {
+        logger.warn({ err: e, mirrorTo: params.mirrorTo }, "mirrorTo: failed to forward response");
+      }
     }
 
     writeLog({
